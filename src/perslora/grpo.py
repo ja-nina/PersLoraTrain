@@ -67,6 +67,8 @@ class GRPOConfig:
     w_correct: float = 0.0
     lambda_onpolicy: float = 0.0
     onpolicy_batch: int = 8  # reasoning rollouts per step that get the on-policy KL
+    eval_every: int = 0  # accuracy on fixed held-out questions at step 0 and every eval_every steps (0: off)
+    eval_tokens: int = 2048
 
     @property
     def adapter(self) -> str:
@@ -127,10 +129,14 @@ def train_adapter(model, tok, cfg: GRPOConfig, questions: list[tuple[str, str]],
                   judge_fn: Callable[[list[Rollout]], list], log_step: Callable[[dict], None],
                   on_samples: Callable[[int, list], None], on_rollouts: Callable[[int, list], None],
                   sampling: dict, prompt_fn: Callable[[str], str],
-                  on_checkpoint: Optional[Callable[[int], None]] = None, reason=None) -> None:
+                  on_checkpoint: Optional[Callable[[int], None]] = None, reason=None,
+                  evals: Optional[dict] = None, eval_sampling: Optional[dict] = None,
+                  on_eval: Optional[Callable[[int, dict], None]] = None) -> None:
     """Attach adapter `cfg.adapter` (if missing) and train it for cfg.steps; all scales are 0 on return.
 
-    `reason`: a tasks.Task (items + score) for the reasoning rollouts; needed when cfg.reason_questions > 0."""
+    `reason`: a tasks.Task (items + score) for the reasoning rollouts; needed when cfg.reason_questions > 0.
+    `evals` {name: Task}: with cfg.eval_every, answered (eval_sampling, one fixed seed, so steps compare) at step 0
+    and every eval_every steps; on_eval(step, {name: accuracy.score_answers result}) gets the results."""
     if cfg.reason_questions and reason is None:
         raise ValueError("reason_questions > 0 needs a reasoning task")
     name = cfg.adapter
@@ -152,7 +158,21 @@ def train_adapter(model, tok, cfg: GRPOConfig, questions: list[tuple[str, str]],
     temperature = float(sampling.get("temperature", 1.0))
     t0 = time.time()
     model.eval()
+
+    def run_evals(step: int) -> None:
+        from perslora.accuracy import score_answers
+        if not (cfg.eval_every and evals and on_eval):
+            return
+        lora.set_scales(model, {name: 1.0})
+        res = {}
+        for tname, t in evals.items():
+            rs = generate(model, tok, t.items, prompt_fn, 1, cfg.eval_tokens, eval_sampling or sampling,
+                          seed=12345, batch=cfg.gen_batch)
+            res[tname] = score_answers(t, rs)
+        on_eval(step, res)
+
     try:
+        run_evals(0)
         for step in range(1, cfg.steps + 1):
             items = [next(stream) for _ in range(cfg.questions_per_step)]
             lora.set_scales(model, {name: 1.0})
@@ -228,6 +248,8 @@ def train_adapter(model, tok, cfg: GRPOConfig, questions: list[tuple[str, str]],
                 on_samples(step, records[:8])
             if on_checkpoint is not None and cfg.save_every and step % cfg.save_every == 0 and step < cfg.steps:
                 on_checkpoint(step)
+            if cfg.eval_every and (step % cfg.eval_every == 0 or step == cfg.steps):
+                run_evals(step)
     finally:
         for p in params:
             p.requires_grad_(False)

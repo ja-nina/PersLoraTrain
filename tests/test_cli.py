@@ -187,3 +187,27 @@ def test_reference_cli(patched, monkeypatch):
     assert meta["questions"] == 2 and meta["kept"] == len(rows)
     from persvectrain.output import load_reference
     assert len(load_reference(p)) == len(rows)
+
+
+def test_train_in_training_evals(patched, monkeypatch):
+    out = patched
+    monkeypatch.setattr(cli, "training_evals", lambda args: {"gsm8k": TinyTask(), "supergpqa": TinyTask(("s1",))})
+    args = [a if a != "2" or i != ARGS.index("--steps") + 1 else "3" for i, a in enumerate(ARGS)]
+    assert cli.main(args + ["--out", str(out), "--eval-every", "2", "--eval-tokens", "3"]) == 0
+    d = out / "lora" / "r" / "assertive_pos"
+    ev = [json.loads(l) for l in (d / "evals.jsonl").read_text().splitlines()]
+    assert [e["step"] for e in ev] == [0, 2, 3]  # start, every 2, and the last step
+    assert 0 <= ev[0]["eval/gsm8k_accuracy"] <= 1 and "eval/supergpqa_cut" in ev[0]
+    assert ev[0]["per_question"]["supergpqa"]["qid"] == ["s1"]
+
+
+def test_training_evals_sets(patched, monkeypatch):
+    from perslora.tasks import Task
+    pool = Task("supergpqa", [("r1", "q1"), ("x", "qx")], {"r1": "A", "x": "B"}, lambda q, t: None)
+    gsm = Task("gsm8k", [(f"g{i}", "q") for i in range(510)], {f"g{i}": "1" for i in range(510)}, lambda q, t: None)
+    monkeypatch.setattr("perslora.tasks.load_task", lambda name, out, n=None: pool if "supergpqa" in name else gsm)
+    a = cli.build_parser().parse_args(["train", "--source", "S", "--out", str(patched), "--run-name", "r",
+                                       "--traits", "Assertive", "--eval-every", "25", "--eval-n", "8"])
+    ev = cli.training_evals(a)
+    assert [i for i, _ in ev["supergpqa"].items] == ["r1"]  # only the KL eval's held-out pool question
+    assert [i for i, _ in ev["gsm8k"].items] == [f"g{i}" for i in range(500, 508)]  # after the final test's 500

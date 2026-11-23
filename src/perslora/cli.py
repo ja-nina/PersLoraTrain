@@ -106,6 +106,25 @@ def _write_samples(path: Path, step: int, records: list) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+EVAL_GSM8K_OFFSET = 500  # the in-training GSM8K set starts after the final test's 500 questions
+
+
+def training_evals(args) -> dict:
+    """Fixed held-out sets for the in-training accuracy curve, disjoint from training and from the final test:
+    SuperGPQA = the KL eval's held-out pool questions (first --eval-n), GSM8K = test questions 500..500+n."""
+    from perslora.tasks import Task, load_task
+
+    _, held, _ = data.kl_reference(args.out, args.model)
+    held_ids = [r.id for r in held]
+    pool = load_task("supergpqa-pool", args.out)
+    keep = set(held_ids[:args.eval_n])
+    sg = Task("supergpqa", [it for it in pool.items if it[0] in keep], {i: pool.gold[i] for i in keep}, pool.parse)
+    g = load_task("gsm8k", args.out)
+    items = g.items[EVAL_GSM8K_OFFSET:EVAL_GSM8K_OFFSET + args.eval_n]
+    gs = Task("gsm8k", items, {i: g.gold[i] for i, _ in items}, g.parse)
+    return {"supergpqa": sg, "gsm8k": gs}
+
+
 def cmd_train(args) -> int:
     root = run_root(args.out, args.run_name)
     slugs = [data.slug_of(t) for t in args.traits]
@@ -125,6 +144,8 @@ def cmd_train(args) -> int:
     if args.reason_questions:
         from perslora.tasks import load_task
         reason = load_task(args.reason_task, args.out, args.reason_n or None)
+    evals = training_evals(args) if args.eval_every else None
+    eval_sampling = sampling_from_spec(args.model, presence=True)
     model, tok = load_model(args.model)
     prompt_fn = prompt_for(tok, args.model)
     sampling = sampling_from_spec(args.model)
@@ -176,6 +197,18 @@ def cmd_train(args) -> int:
                 f"trait {entry['trait_mean']:.1f} coh {entry['coherence_mean']:.1f} kl {entry['kl']:.4f} "
                 f"lam_kl {entry['lam_kl']:.2f} |dW| {entry['delta_norm']:.3f}{extra}")
 
+        def on_eval(step, res, d=d, cfg=cfg):
+            entry = {"step": step}
+            for t, r in res.items():
+                entry.update({f"eval/{t}_{k}": v for k, v in r["summary"].items() if k != "n"})
+            with (d / "evals.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps({**entry, "per_question": {t: r["per_question"] for t, r in res.items()}})
+                        + "\n")
+            wb.log({k: v for k, v in entry.items() if k != "step"}, step=step)
+            log(f"{cfg.adapter} eval step {step}: " + " ".join(
+                f"{t} acc {r['summary']['accuracy']:.3f} (cut {r['summary']['cut']:.2f}, n {r['summary']['n']})"
+                for t, r in res.items()))
+
         def on_rollouts(step, records):
             for r in records:
                 roll_f.write(json.dumps(r) + "\n")
@@ -189,7 +222,8 @@ def cmd_train(args) -> int:
                           log_step=log_step,
                           on_samples=lambda s, recs, d=d: _write_samples(d / "samples" / f"step_{s}.md", s, recs),
                           on_rollouts=on_rollouts, sampling=sampling, prompt_fn=prompt_fn,
-                          on_checkpoint=lambda step, save=save: save("running"), reason=reason)
+                          on_checkpoint=lambda step, save=save: save("running"), reason=reason,
+                          evals=evals, eval_sampling=eval_sampling, on_eval=on_eval)
         except BaseException:
             save("crashed")  # keep the steps done so far (adapter.json records the step)
             log(f"{cfg.adapter} crashed after step {last['step']}; partial adapter saved in {d}")
@@ -534,6 +568,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="KL reference files (`reference` output); default PersVecTrain's 512-token pool answers")
     p.add_argument("--reason-task", default="gsm8k-train", help="task of the reasoning rollouts")
     p.add_argument("--reason-n", type=int, default=0, help="first N questions of the reasoning task (0: all)")
+    p.add_argument("--eval-n", type=int, default=128,
+                   help="questions per task in the in-training accuracy eval (SuperGPQA has 100 held out)")
     p.add_argument("--leak-traits", nargs="+", default=None,
                    help="traits whose expression --c-leak penalises (default: the other --traits)")
     for f in _cfg_fields():
