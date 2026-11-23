@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perslora"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["torch", "transformers", "safetensors"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+wandb = ["wandb"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
