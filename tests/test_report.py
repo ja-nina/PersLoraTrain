@@ -70,3 +70,28 @@ def test_report_end_to_end(tmp_path, capsys):
     assert "assertive_pos:1+sarcastic_pos:1" in out and f"{A}+{B}" not in out.replace(f"{A}:1+{B}:1", "")
     assert f"{A}@step_75" in out
     assert "=== summary" in out and "assertive_pos:0.5+sarcastic_pos:0.5" in out.split("=== summary")[1]
+
+
+def test_report_wandb_table(tmp_path, monkeypatch, capsys):
+    fake_out(tmp_path)
+    logged = {}
+
+    class FakeWandb:
+        def __init__(self, project, entity, name, config, group):
+            self.run = type("R", (), {"summary": {}})()
+            logged["name"] = name
+            logged["summary"] = self.run.summary
+
+        def log(self, entry, step=None):
+            logged.update(entry)
+
+        def finish(self):
+            pass
+
+    import sys, types
+    monkeypatch.setattr(cli, "Wandb", FakeWandb)
+    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(Table=lambda columns, data: (columns, data)))
+    assert cli.main(["report", "--out", str(tmp_path), "--runs", "kl", "--wandb-project", "p"]) == 0
+    cols, data = logged["accuracy"]
+    assert cols[:3] == ["run", "task", "condition"] and len(data) == 2 * (1 + 5)
+    assert "kl/gsm8k/assertive_pos/pass" in logged["summary"]

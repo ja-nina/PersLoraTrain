@@ -395,6 +395,11 @@ def cmd_accuracy(args) -> int:
         s = res["summary"]
         log(f"{args.task} {spec}: acc {s['accuracy']:.3f} unparsed {s['unparsed']:.3f} cut {s['cut']:.3f} "
             f"tokens {s['tokens_mean']:.0f} ({res['seconds']} s) -> {p}")
+        if args.wandb_project:
+            wb = Wandb(args.wandb_project, args.wandb_entity, f"{args.run_name}/acc-{args.task}/{spec}",
+                       {**settings, "spec": spec}, args.run_name)
+            wb.log({f"{args.task}/{k}": v for k, v in s.items()})
+            wb.finish()
     return 0
 
 
@@ -432,6 +437,7 @@ def cmd_report(args) -> int:
         if p.exists():
             bases[t] = json.loads(p.read_text(encoding="utf-8"))
     collected = {}
+    table: list = []
     for name in args.runs:
         root = run_root(args.out, name)
         if not root.exists():
@@ -447,7 +453,20 @@ def cmd_report(args) -> int:
                     del res[spec]
         print(report.run_report(name, steps, ev, accs, bases, args.delta) + "\n")
         collected[name] = (ev, report.run_gates(accs, bases, args.delta))
+        table += report.accuracy_rows(name, accs, bases, args.delta)
     print(report.summary(collected))
+    if args.wandb_project:
+        wb = Wandb(args.wandb_project, args.wandb_entity, "accuracy-report", {"delta": args.delta,
+                                                                            "runs": args.runs}, "report")
+        if wb.run is not None:
+            import wandb
+            wb.log({"accuracy": wandb.Table(columns=list(report.ACC_COLS), data=table)})
+            for r in table:  # also as summary numbers, e.g. correct/gsm8k/assertive_pos/diff
+                row = dict(zip(report.ACC_COLS, r))
+                for k in ("accuracy", "diff", "lower95", "pass"):
+                    wb.run.summary[f"{row['run']}/{row['task']}/{row['condition']}/{k}"] = row[k]
+        wb.finish()
+        log(f"logged {len(table)} accuracy rows to wandb project {args.wandb_project}")
     return 0
 
 
@@ -577,6 +596,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--runs", nargs="+", default=["mvp", "kl", "onpol", "correct", "leak"])
     p.add_argument("--delta", type=float, default=0.03)
+    p.add_argument("--wandb-project", default=None, help="also upload the accuracy table and gates")
+    p.add_argument("--wandb-entity", default=None)
     p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("gpucheck", help="LoRA wrap count, stop tokens, batched vs single greedy generation")

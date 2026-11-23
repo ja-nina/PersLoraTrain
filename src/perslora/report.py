@@ -186,3 +186,23 @@ def summary(results: dict[str, tuple]) -> str:
                 verdict.append("-" if g is None else ("PASS" if g["gate"]["pass"] else "FAIL"))
             L.append(f"  {run:<9}{c:<38}{gains:>14}{p['coherence']['mean']:>7.1f}{verdict[0]:>11}{verdict[1]:>8}")
     return "\n".join(L)
+
+
+ACC_COLS = ("run", "task", "condition", "accuracy", "base_accuracy", "diff", "se", "lower95", "pass", "unparsed",
+            "cut", "tokens_mean", "n")
+
+
+def accuracy_rows(run: str, accs: dict[str, dict], bases: dict[str, dict], delta: float) -> list[list]:
+    """One row per (task, condition) with its gate, in ACC_COLS order; base rows have no diff."""
+    rows = []
+    for t in ("supergpqa", "gsm8k"):
+        if t not in bases:
+            continue
+        b = bases[t]["summary"]
+        rows.append([run, t, "base", b["accuracy"], b["accuracy"], None, None, None, None, b["unparsed"], b["cut"],
+                     b["tokens_mean"], b["n"]])
+        for spec, res in sorted(accs.get(t, {}).items()):
+            s, g = res["summary"], acc.gate(bases[t], res, delta)
+            rows.append([run, t, spec, s["accuracy"], b["accuracy"], g["diff"], g["se"], g["lower95"], g["pass"],
+                         s["unparsed"], s["cut"], s["tokens_mean"], s["n"]])
+    return rows

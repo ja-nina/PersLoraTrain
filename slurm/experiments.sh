@@ -14,6 +14,7 @@ RUNS="kl onpol correct leak"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 
 if [ "${1:-}" = "gates" ]; then
+  python -m perslora report --out "$O" $WB || true
   for r in mvp $RUNS; do
     echo "=== $r"
     python -m perslora gate --out "$O" --run-name "$r" --task supergpqa gsm8k || true
@@ -32,9 +33,9 @@ REFS="$O/lora/refs/supergpqa-pool.jsonl $O/lora/refs/gsm8k-train.jsonl"
 
 # base accuracy (shared by all runs) and the MVP adapters' accuracy
 for t in supergpqa gsm8k; do
-  sb slurm/plt.sbatch accuracy --out "$O" --run-name _base --task "$t" --cond base >/dev/null
+  sb slurm/plt.sbatch accuracy --out "$O" --run-name _base --task "$t" --cond base $WB >/dev/null
   sb slurm/plt.sbatch accuracy --out "$O" --run-name mvp --task "$t" \
-     --cond $A $B "$A:0.5+$B:0.5" "$A+$B" >/dev/null
+     --cond $A $B "$A:0.5+$B:0.5" "$A+$B" $WB >/dev/null
 done
 
 # shared training settings: coherence floor at the base level, a KL budget that binds (eta scaled to KL ~ 1e-2)
@@ -51,7 +52,7 @@ for r in $RUNS; do
   sb --dependency=afterok:$J slurm/plt.sbatch evaluate --out "$O" --run-name "$r" --grid 0,0.5,1 $WB >/dev/null
   for t in supergpqa gsm8k; do
     sb --dependency=afterok:$J slurm/plt.sbatch accuracy --out "$O" --run-name "$r" --task "$t" \
-       --cond $A $B "$A@step_75" "$B@step_75" "$A:0.5+$B:0.5" "$A+$B" >/dev/null
+       --cond $A $B "$A@step_75" "$B@step_75" "$A:0.5+$B:0.5" "$A+$B" $WB >/dev/null
   done
   echo "run $r: train job $J"
 done
