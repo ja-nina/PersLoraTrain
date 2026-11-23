@@ -122,7 +122,8 @@ def training_evals(args) -> dict:
     g = load_task("gsm8k", args.out)
     items = g.items[EVAL_GSM8K_OFFSET:EVAL_GSM8K_OFFSET + args.eval_n]
     gs = Task("gsm8k", items, {i: g.gold[i] for i, _ in items}, g.parse)
-    return {"supergpqa": sg, "gsm8k": gs}
+    sets = {"supergpqa": sg, "gsm8k": gs}
+    return {t: sets[t] for t in args.eval_tasks}
 
 
 def cmd_train(args) -> int:
@@ -373,6 +374,9 @@ def cmd_reference(args) -> int:
     return 0
 
 
+ACC_MAX_TOKENS = {"supergpqa": 15360, "gsm8k": 4096}  # SuperGPQA: the games' max_tokens (long answers)
+
+
 def acc_path(out: Path, run_name: str, task: str, spec: str) -> Path:
     """base is shared by all runs (it does not depend on one)."""
     from perslora.accuracy import cond_label
@@ -386,6 +390,8 @@ def cmd_accuracy(args) -> int:
     from perslora.rollout import generate
     from perslora.tasks import load_task
 
+    if args.max_tokens is None:
+        args.max_tokens = ACC_MAX_TOKENS[args.task]
     task = load_task(args.task, args.out, args.n or None)
     root = run_root(args.out, args.run_name)
     todo = [s for s in args.cond if args.force or not acc_path(args.out, args.run_name, args.task, s).exists()]
@@ -568,6 +574,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="KL reference files (`reference` output); default PersVecTrain's 512-token pool answers")
     p.add_argument("--reason-task", default="gsm8k-train", help="task of the reasoning rollouts")
     p.add_argument("--reason-n", type=int, default=0, help="first N questions of the reasoning task (0: all)")
+    p.add_argument("--eval-tasks", nargs="+", default=["gsm8k"], choices=("gsm8k", "supergpqa"),
+                   help="in-training eval sets (SuperGPQA answers need ~15k tokens: slow, off by default)")
     p.add_argument("--eval-n", type=int, default=128,
                    help="questions per task in the in-training accuracy eval (SuperGPQA has 100 held out)")
     p.add_argument("--leak-traits", nargs="+", default=None,
@@ -614,7 +622,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cond", nargs="+", required=True,
                    help="base | adapter[@step_N][:scale][+adapter...], e.g. assertive_pos:0.5+sarcastic_pos:0.5")
     p.add_argument("--n", type=int, default=500)
-    p.add_argument("--max-tokens", type=int, default=4096)
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="default per task: supergpqa 15360 (the games' limit), gsm8k 4096")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--gen-batch", type=int, default=64)
     p.add_argument("--force", action="store_true", help="redo conditions that already have a result")
