@@ -422,6 +422,35 @@ def cmd_gate(args) -> int:
     return 0
 
 
+def cmd_report(args) -> int:
+    from perslora import accuracy as acc
+    from perslora import report
+
+    bases = {}
+    for t in ("supergpqa", "gsm8k"):
+        p = acc_path(args.out, "", t, "base")
+        if p.exists():
+            bases[t] = json.loads(p.read_text(encoding="utf-8"))
+    collected = {}
+    for name in args.runs:
+        root = run_root(args.out, name)
+        if not root.exists():
+            print(f"=== run {name}: {root} missing\n")
+            continue
+        steps, ev, accs = report.load_run(root)
+        for t, res in accs.items():
+            for spec in list(res):
+                try:
+                    acc.check_settings(bases[t], res[spec]) if t in bases else None
+                except SystemExit as e:
+                    print(f"[{name} {t} {spec}: left out, {e}]")
+                    del res[spec]
+        print(report.run_report(name, steps, ev, accs, bases, args.delta) + "\n")
+        collected[name] = (ev, report.run_gates(accs, bases, args.delta))
+    print(report.summary(collected))
+    return 0
+
+
 # ---------------------------------------------------------------- gpucheck
 
 GPUCHECK_QUESTIONS = ("Hi.", "What is the capital of France? Answer in one sentence.",
@@ -543,6 +572,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task", nargs="+", default=["supergpqa", "gsm8k"])
     p.add_argument("--delta", type=float, default=0.03, help="largest accuracy drop accepted")
     p.set_defaults(func=cmd_gate)
+
+    p = sub.add_parser("report", help="training, persona, accuracy gates and composition grid of runs")
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--runs", nargs="+", default=["mvp", "kl", "onpol", "correct", "leak"])
+    p.add_argument("--delta", type=float, default=0.03)
+    p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("gpucheck", help="LoRA wrap count, stop tokens, batched vs single greedy generation")
     p.add_argument("--model", default="qwen3.5-2b", choices=sorted(MODELS))
