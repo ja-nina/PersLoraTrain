@@ -27,7 +27,7 @@ python -m perslora prepare --out "$O"
 
 # base answers as KL references: science (pool minus the KL eval's 100 held questions), math (correct only)
 REF_SCI=$(sb slurm/plt.sbatch reference --out "$O" --task supergpqa-pool --samples 2 --max-tokens 3072)
-REF_MATH=$(sb slurm/plt.sbatch reference --out "$O" --task gsm8k-train --n 400 --samples 1 --max-tokens 768 --correct-only)
+REF_MATH=$(sb slurm/plt.sbatch reference --out "$O" --task gsm8k-train --n 400 --samples 1 --max-tokens 1024 --correct-only)
 REFS="$O/lora/refs/supergpqa-pool.jsonl $O/lora/refs/gsm8k-train.jsonl"
 
 # base accuracy (shared by all runs) and the MVP adapters' accuracy
@@ -39,7 +39,7 @@ done
 
 # shared training settings: coherence floor at the base level, a KL budget that binds (eta scaled to KL ~ 1e-2)
 COMMON="--source $S --out $O --traits $TRAITS --coh-floor 85 --eps-kl 0.005 --eta-kl 50 --kl-batch 4 --kl-refs $REFS $WB"
-REASON="--reason-questions 4 --reason-g 4 --reason-tokens 768 --lambda-onpolicy 2.0"
+REASON="--reason-questions 4 --reason-g 4 --reason-tokens 1024 --lambda-onpolicy 2.0"
 declare -A EXTRA=(
   [kl]=""
   [onpol]="$REASON"
