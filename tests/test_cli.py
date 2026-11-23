@@ -144,6 +144,24 @@ def test_train_with_leak_reason_and_checkpoints(patched, monkeypatch):
     assert meta["leak_traits"] == ["sarcastic"] and meta["reason_task"] == "gsm8k-train"
 
 
+def test_train_keep_from_skips_finished_adapters(patched, monkeypatch):
+    out = patched
+    assert cli.main(ARGS + ["--out", str(out)]) == 0
+    a, b = (out / "lora" / "r" / f"{s}_pos" for s in ("assertive", "sarcastic"))
+    meta = json.loads((b / "train.json").read_text())
+    (b / "train.json").write_text(json.dumps({**meta, "status": "crashed", "last_step": 1}))
+    before = (a / "steps.jsonl").read_text()
+    trained = []
+    real = cli.train_adapter
+    monkeypatch.setattr(cli, "train_adapter", lambda model, tok, cfg, *x, **k: (trained.append(cfg.trait),
+                                                                                  real(model, tok, cfg, *x, **k)))
+    assert cli.main(ARGS + ["--out", str(out), "--keep-from", "2"]) == 0  # no --overwrite needed
+    assert trained == ["sarcastic"]  # assertive (done at step 2) is kept, sarcastic (crashed at 1) is redone
+    assert (a / "steps.jsonl").read_text() == before
+    assert json.loads((b / "train.json").read_text())["status"] == "done"
+    assert len((b / "steps.jsonl").read_text().splitlines()) == 2  # from scratch, not appended
+
+
 def test_accuracy_and_gate_cli(patched, monkeypatch, capsys):
     out = patched
     args = [a if a != "2" or i != ARGS.index("--steps") + 1 else "3" for i, a in enumerate(ARGS)]

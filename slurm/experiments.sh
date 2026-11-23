@@ -5,6 +5,8 @@
 # Afterwards (login node, no GPU): bash slurm/experiments.sh gates
 # Only the training runs (+ their eval / accuracy), when references and base / MVP accuracy exist already:
 #   bash slurm/experiments.sh runs
+# Resume crashed runs (keeps adapters saved at step >= KEEP=140, retrains the rest; RUNS="kl onpol" to pick):
+#   bash slurm/experiments.sh resume
 set -euo pipefail
 O="${O:-/scratch/inf0/user/nzukowsk/PersVecFast/out}"
 S="${S:-$O}"
@@ -12,7 +14,7 @@ WB="${WB:---wandb-project perslora}"
 TRAITS="Assertive Sarcastic"
 A=assertive_pos
 B=sarcastic_pos
-RUNS="kl onpol correct leak"
+RUNS="${RUNS:-kl onpol correct leak}"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 
 if [ "${1:-}" = "gates" ]; then
@@ -29,7 +31,7 @@ REFS="$O/lora/refs/supergpqa-pool.jsonl $O/lora/refs/gsm8k-train.jsonl"
 DEP=""
 OW=""
 
-if [ "${1:-}" != "runs" ]; then
+if [ "${1:-}" != "runs" ] && [ "${1:-}" != "resume" ]; then
 python -m perslora prepare --out "$O"
 
 # base answers as KL references: science (pool minus the KL eval's 100 held questions), math (correct only)
@@ -48,6 +50,8 @@ done
 echo "references: $REF_SCI $REF_MATH"
 else
   OW="--overwrite"  # the runs restart from scratch
+  # resume after a crash: keep adapters saved at step >= KEEP (default 140 of 150), retrain the others
+  [ "$1" = "resume" ] && OW="--keep-from ${KEEP:-140}"
   for f in $REFS; do [ -s "$f" ] || { echo "$f missing: run the full script first" >&2; exit 1; }; done
 fi
 

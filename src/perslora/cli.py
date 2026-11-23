@@ -130,8 +130,15 @@ def cmd_train(args) -> int:
     root = run_root(args.out, args.run_name)
     slugs = [data.slug_of(t) for t in args.traits]
     dirs = {s: root / f"{s}_{args.direction}" for s in slugs}
+    if args.keep_from:  # resume a crashed job: keep adapters that got far enough, redo the rest from scratch
+        for s, d in list(dirs.items()):
+            meta = json.loads((d / "train.json").read_text()) if (d / "train.json").exists() else {}
+            if meta.get("last_step", 0) >= args.keep_from and (d / "adapter.json").exists():
+                log(f"keep {d.name}: {meta.get('status')} at step {meta['last_step']}")
+                del dirs[s]
+        slugs = [s for s in slugs if s in dirs]
     for d in dirs.values():
-        if d.exists() and not args.overwrite:
+        if d.exists() and not (args.overwrite or args.keep_from):
             raise SystemExit(f"{d} exists; pass --overwrite to replace it")
     src = data.source_dir(args.source, args.model)
     if args.kl_refs:
@@ -570,6 +577,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--traits", nargs="+", required=True)
     p.add_argument("--direction", choices=("pos", "neg"), default="pos")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--keep-from", type=int, default=0,
+                   help="resume: keep adapters saved at step >= N (done or crashed), retrain the others from scratch")
     p.add_argument("--kl-refs", type=Path, nargs="+", default=None,
                    help="KL reference files (`reference` output); default PersVecTrain's 512-token pool answers")
     p.add_argument("--reason-task", default="gsm8k-train", help="task of the reasoning rollouts")
