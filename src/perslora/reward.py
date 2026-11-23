@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from persvecfast.judge import clip
+from persvecfast.judge import JudgeError, clip
 
 KEYS = ("trait", "opposite", "coherence", "on_task", "denial")
 SCORES = KEYS[:4]
@@ -74,8 +74,15 @@ def judge_prompt(trait: dict, question: str, response: str, max_chars: int) -> s
 
 
 async def _one(judges, prompt: str) -> Optional[dict]:
-    for _ in range(2):  # one retry on an unparseable reply; transport errors are retried by the client
-        raw = await judges.client.complete(prompt, model=judges.expression_model, temperature=0.0)
+    """One retry; a failed call (after the client's own transport retries) or an unparseable reply -> None.
+    Only JudgeError (no credit, bad key, unknown model: cannot succeed by retrying) propagates."""
+    for _ in range(2):
+        try:
+            raw = await judges.client.complete(prompt, model=judges.expression_model, temperature=0.0)
+        except JudgeError:
+            raise
+        except Exception:  # noqa: BLE001  (e.g. a 200 reply without "choices", retries exhausted)
+            continue
         v = parse_vector(raw)
         if v is not None:
             return v
@@ -141,10 +148,11 @@ class Floor:
     lam: float = 0.0
     ema: Optional[float] = None
     decay: float = 0.9
+    lam_max: float = 2.0  # z-scored components: a larger lam would replace the trait reward
 
     def update(self, value: float) -> float:
         self.ema = value if self.ema is None else self.decay * self.ema + (1 - self.decay) * value
-        self.lam = max(0.0, self.lam + self.eta * (self.target - self.ema))
+        self.lam = min(self.lam_max, max(0.0, self.lam + self.eta * (self.target - self.ema)))
         return self.lam
 
 

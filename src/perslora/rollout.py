@@ -27,10 +27,22 @@ def sampling_from_spec(model_key: str) -> dict:
 
 
 def _eos_ids(model, tok) -> set[int]:
-    eos = getattr(model.generation_config, "eos_token_id", None)
-    if eos is None:
-        eos = tok.eos_token_id
-    return set(eos if isinstance(eos, (list, tuple)) else [eos])
+    """Union of the generation config's eos ids, the tokenizer's eos and <|im_end|> (the chat turn end; the text
+    config of Qwen3.5 has <|endoftext|> as eos)."""
+    ids: set[int] = set()
+    eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    for e in (eos if isinstance(eos, (list, tuple)) else [eos]):
+        if e is not None:
+            ids.add(int(e))
+    if getattr(tok, "eos_token_id", None) is not None:
+        ids.add(int(tok.eos_token_id))
+    conv = getattr(tok, "convert_tokens_to_ids", None)
+    if conv is not None:
+        im_end = conv("<|im_end|>")
+        unk = getattr(tok, "unk_token_id", None)
+        if isinstance(im_end, int) and im_end != unk:
+            ids.add(im_end)
+    return ids
 
 
 @torch.no_grad()
@@ -52,9 +64,12 @@ def generate(model, tok, items: list[tuple[str, str]], prompt_fn: Callable[[str]
         for j, (_, _, p) in enumerate(chunk):
             ids[j, width - len(p):] = torch.tensor(p)
             mask[j, width - len(p):] = 1
-        kw = {"temperature": sampling.get("temperature", 1.0), "top_p": sampling.get("top_p", 1.0),
-              "top_k": sampling.get("top_k", 0) or None}
-        gen = model.generate(input_ids=ids.to(model.device), attention_mask=mask.to(model.device), do_sample=True,
+        if sampling.get("temperature", 1.0) == 0:  # greedy (gpucheck)
+            kw = {"do_sample": False, "temperature": None, "top_p": None, "top_k": None}
+        else:
+            kw = {"do_sample": True, "temperature": sampling.get("temperature", 1.0),
+                  "top_p": sampling.get("top_p", 1.0), "top_k": sampling.get("top_k", 0) or None}
+        gen = model.generate(input_ids=ids.to(model.device), attention_mask=mask.to(model.device),
                              max_new_tokens=max_new_tokens, pad_token_id=pad, eos_token_id=sorted(eos), **kw)
         for j, (qid, q, p) in enumerate(chunk):
             ans = gen[j, width:].tolist()
@@ -68,11 +83,19 @@ def generate(model, tok, items: list[tuple[str, str]], prompt_fn: Callable[[str]
     return out
 
 
-def seq_logprob(model, r: Rollout) -> Tensor:
-    """Summed log p of the answer tokens given the prompt (grad flows to trainable params); 0 for an empty answer."""
+def seq_logprob(model, r: Rollout, temperature: float = 1.0) -> Tensor:
+    """Summed log p_T of the answer tokens given the prompt, logits divided by the sampling temperature (the
+    distribution the rollout was drawn from, up to top-p / top-k truncation); grad flows to trainable params;
+    0 for an empty answer."""
     if not r.answer_ids:
         return torch.zeros(())
     ids = torch.tensor([r.prompt_ids + r.answer_ids])
-    lp = answer_logprobs(model, ids, len(r.prompt_ids))
+    start = len(r.prompt_ids)
+    if temperature == 1.0:
+        lp = answer_logprobs(model, ids, start)
+    else:
+        T = ids.shape[1]
+        logits = model(ids.to(model.device), logits_to_keep=T - start + 1, use_cache=False).logits[0, :-1]
+        lp = torch.log_softmax(logits.float() / temperature, dim=-1)
     tgt = torch.tensor(r.answer_ids, device=lp.device)
     return lp.gather(1, tgt[:, None]).sum()

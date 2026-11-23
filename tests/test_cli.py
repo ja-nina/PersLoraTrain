@@ -75,3 +75,37 @@ def test_evaluate_cli_end_to_end(patched, monkeypatch):
     assert set(res["kl"]) == {"base", "assertive_pos", "sarcastic_pos", "sum", "half"}
     assert res["persona"]["sum"]["expression"]["assertive"]["mean"] == 50
     assert set(res["accuracy"]) == set(res["kl"])
+
+
+def test_crash_saves_partial_adapter(patched, monkeypatch):
+    out = patched
+    from persvecfast.judge import JudgeError
+    calls = {"n": 0}
+
+    def factory(args):
+        def judge(rollouts, trait):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise JudgeError("no credit")
+            return [{"trait": 50, "opposite": 10, "coherence": 90, "on_task": 90, "denial": False} for _ in rollouts]
+        return judge
+
+    monkeypatch.setattr(cli, "make_judge", factory)
+    with pytest.raises(JudgeError):
+        cli.main(ARGS + ["--out", str(out)])
+    d = out / "lora" / "r" / "assertive_pos"
+    assert (d / "adapter.safetensors").exists()
+    meta = json.loads((d / "train.json").read_text())
+    assert meta["status"] == "crashed" and meta["last_step"] == 1
+
+
+class ImEndTok(CharTokenizer):
+    def convert_tokens_to_ids(self, t):
+        return 0  # the char tokenizer's EOS stands in for <|im_end|>
+
+
+def test_gpucheck_tiny(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "load_model", lambda key: (make_tiny_model(), ImEndTok()))
+    monkeypatch.setattr(cli, "prompt_for", lambda tok, model: (lambda q: f"<u>{q}<a>"))
+    assert cli.main(["gpucheck", "--max-new-tokens", "5"]) == 0
+    assert "GPUCHECK OK" in capsys.readouterr().out

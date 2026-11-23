@@ -51,3 +51,19 @@ def test_persona_eval_fake_judges():
     assert out["a_pos"]["expression"]["b"]["mean"] == 10
     assert out["base"]["coherence"]["mean"] == 80
     assert out["a_pos"]["n"] == 4  # 2 questions x 2 samples
+
+
+def test_kl_eval_one_reference_at_a_time(tiny_model, char_tok, monkeypatch):
+    lora.attach(tiny_model, "a_pos")
+    calls = []
+    real = evaluate.answer_logprobs
+
+    def spy(model, ids, start):
+        mods = lora.wrapped_modules(model).values()
+        calls.append(next(iter(mods)).scales.get("a_pos", 0.0))
+        return real(model, ids, start)
+
+    monkeypatch.setattr(evaluate, "answer_logprobs", spy)
+    refs = [RefAnswer("r1", "q?", "some answer", "A"), RefAnswer("r2", "z?", "other one", "B")]
+    evaluate.kl_eval(tiny_model, char_tok, {"base": {}, "a_pos": {"a_pos": 1.0}}, refs, kl_tokens=8)
+    assert calls == [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]  # per ref: reference, then each condition

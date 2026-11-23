@@ -49,6 +49,8 @@ class GRPOConfig:
     eta_floor: float = 0.05
     c_denial: float = 1.0
     sample_every: int = 25
+    save_every: int = 25
+    lam_floor_max: float = 2.0
     gen_batch: int = 64
 
     @property
@@ -83,7 +85,8 @@ def _kl_step(model, name: str, enc: tuple, scale: float) -> float:
 def train_adapter(model, tok, cfg: GRPOConfig, questions: list[tuple[str, str]], kl_refs: list,
                   judge_fn: Callable[[list[Rollout]], list], log_step: Callable[[dict], None],
                   on_samples: Callable[[int, list], None], on_rollouts: Callable[[int, list], None],
-                  sampling: dict, prompt_fn: Callable[[str], str]) -> None:
+                  sampling: dict, prompt_fn: Callable[[str], str],
+                  on_checkpoint: Optional[Callable[[int], None]] = None) -> None:
     """Attach adapter `cfg.adapter` (if missing) and train it for cfg.steps; all scales are 0 on return."""
     name = cfg.adapter
     if name not in lora.adapter_names(model):
@@ -97,7 +100,9 @@ def train_adapter(model, tok, cfg: GRPOConfig, questions: list[tuple[str, str]],
     kl_cursor = 0
     fixed = cfg.lambda_kl is not None
     budget = Budget(eps=cfg.eps_kl, eta=cfg.eta_kl, lam=cfg.lambda_kl if fixed else cfg.lam_kl_init)
-    coh, task = Floor(cfg.coh_floor, cfg.eta_floor), Floor(cfg.task_floor, cfg.eta_floor)
+    coh = Floor(cfg.coh_floor, cfg.eta_floor, lam_max=cfg.lam_floor_max)
+    task = Floor(cfg.task_floor, cfg.eta_floor, lam_max=cfg.lam_floor_max)
+    temperature = float(sampling.get("temperature", 1.0))
     t0 = time.time()
     model.eval()
     try:
@@ -115,7 +120,7 @@ def train_adapter(model, tok, cfg: GRPOConfig, questions: list[tuple[str, str]],
             for r, a in zip(rollouts, adv):
                 if a == 0.0 or not r.answer_ids:
                     continue
-                (-a * seq_logprob(model, r) / (cfg.max_new_tokens * n)).backward()
+                (-a * seq_logprob(model, r, temperature) / (cfg.max_new_tokens * n)).backward()
             lam_kl = budget.lam
             kls = []
             for _ in range(cfg.kl_batch if kl_enc else 0):
@@ -151,6 +156,8 @@ def train_adapter(model, tok, cfg: GRPOConfig, questions: list[tuple[str, str]],
             on_rollouts(step, records)
             if cfg.sample_every and step % cfg.sample_every == 0:
                 on_samples(step, records[:8])
+            if on_checkpoint is not None and cfg.save_every and step % cfg.save_every == 0 and step < cfg.steps:
+                on_checkpoint(step)
     finally:
         for p in params:
             p.requires_grad_(False)

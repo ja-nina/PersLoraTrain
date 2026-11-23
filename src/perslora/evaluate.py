@@ -35,13 +35,16 @@ def conditions(adapters: list[str]) -> dict[str, dict[str, float]]:
 @torch.no_grad()
 def kl_eval(model, tok, conds: dict, refs: list, kl_tokens: int) -> dict:
     """Mean per-token KL(base || condition) over the held-out reference answers, per condition."""
-    enc = [encode(tok, r.question, r.answer_text, kl_tokens) for r in refs]
-    lora.set_scales(model, {})
-    base = [answer_logprobs(model, ids, s) for ids, s in enc]
-    out = {}
-    for name, scales in conds.items():
-        lora.set_scales(model, scales)
-        out[name] = _ms([float(kl_loss(lp0, answer_logprobs(model, ids, s))) for lp0, (ids, s) in zip(base, enc)])
+    per: dict[str, list[float]] = {name: [] for name in conds}
+    for r in refs:  # one reference at a time: a [T, vocab] fp32 block is ~0.5 GB for Qwen3.5
+        ids, s = encode(tok, r.question, r.answer_text, kl_tokens)
+        lora.set_scales(model, {})
+        lp0 = answer_logprobs(model, ids, s)
+        for name, scales in conds.items():
+            lora.set_scales(model, scales)
+            per[name].append(float(kl_loss(lp0, answer_logprobs(model, ids, s))))
+        del lp0
+    out = {name: _ms(v) for name, v in per.items()}
     lora.set_scales(model, {})
     return out
 

@@ -68,3 +68,12 @@ def test_adapter_scale_reset_after_training(tiny_model, char_tok):
     run(tiny_model, char_tok, cfg(steps=1))
     mods = lora.wrapped_modules(tiny_model).values()
     assert all(m.scales["x_pos"] == 0.0 for m in mods)
+
+
+def test_checkpoint_callback(tiny_model, char_tok):
+    saved = []
+    grpo.train_adapter(tiny_model, char_tok, cfg(steps=5, save_every=2), QS, REFS, fake_judge,
+                       log_step=lambda e: None, on_samples=lambda s, x: None, on_rollouts=lambda s, x: None,
+                       sampling={"temperature": 1.0}, prompt_fn=lambda q: f"<u>{q}<a>",
+                       on_checkpoint=saved.append)
+    assert saved == [2, 4]

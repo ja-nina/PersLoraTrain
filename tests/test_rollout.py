@@ -41,3 +41,25 @@ def test_empty_answer_zero(tiny_model):
 def test_sampling_from_spec():
     s = rollout.sampling_from_spec("qwen3.5-2b")
     assert set(s) == {"temperature", "top_p", "top_k"} and s["temperature"] > 0
+
+
+def test_seq_logprob_temperature(tiny_model):
+    r = rollout.Rollout("a", "hi", [5, 6, 7], [9, 10], "xy")
+    ids = torch.tensor([[5, 6, 7, 9, 10]])
+    with torch.no_grad():
+        logits = tiny_model(ids).logits[0, 2:4].float() / 0.5
+    want = torch.log_softmax(logits, -1).gather(1, torch.tensor([[9], [10]])).sum()
+    assert torch.allclose(rollout.seq_logprob(tiny_model, r, temperature=0.5), want, atol=1e-5)
+    assert torch.allclose(rollout.seq_logprob(tiny_model, r), rollout.seq_logprob(tiny_model, r, 1.0))
+
+
+class ImTok:
+    eos_token_id = 7
+
+    def convert_tokens_to_ids(self, t):
+        return 9 if t == "<|im_end|>" else None
+
+
+def test_eos_ids_union(tiny_model):
+    tiny_model.generation_config.eos_token_id = 3
+    assert rollout._eos_ids(tiny_model, ImTok()) == {3, 7, 9}

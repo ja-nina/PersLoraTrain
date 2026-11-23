@@ -55,7 +55,7 @@ def test_denial_penalised():
 
 
 def test_floor_rises_below_target():
-    f = reward.Floor(target=80, eta=0.1)
+    f = reward.Floor(target=80, eta=0.01)
     lams = [f.update(50) for _ in range(5)]
     assert lams[-1] > lams[0] > 0
     for _ in range(200):
@@ -99,3 +99,33 @@ def test_judge_vectors_fake_client():
     assert out[1] is None  # unparseable twice
     assert len(client.prompts) == 4  # one retry for the bad one
     assert "Assertive" in client.prompts[0] and "Hesitant." in client.prompts[0] and "answer one" in client.prompts[0]
+
+
+class RaisingClient:
+    def __init__(self, exc):
+        self.exc = exc
+
+    async def complete(self, prompt, model=None, temperature=None):
+        raise self.exc
+
+
+def test_judge_transport_error_is_none():
+    rs = [Rollout("q1", "Q?", [1], [2], "an answer")]
+    trait = {"trait": "A", "description": "d", "instruction": {"negative": "n"}}
+    out = asyncio.run(reward.judge_vectors(FakeJudges(RaisingClient(KeyError("choices"))), rs, trait))
+    assert out == [None]
+
+
+def test_judge_fatal_error_raises():
+    from persvecfast.judge import JudgeError
+    rs = [Rollout("q1", "Q?", [1], [2], "an answer")]
+    trait = {"trait": "A", "description": "d", "instruction": {"negative": "n"}}
+    with pytest.raises(JudgeError):
+        asyncio.run(reward.judge_vectors(FakeJudges(RaisingClient(JudgeError("no credit"))), rs, trait))
+
+
+def test_floor_lambda_capped():
+    f = reward.Floor(target=80, eta=1.0, lam_max=2.0)
+    for _ in range(50):
+        f.update(0)
+    assert f.lam == 2.0

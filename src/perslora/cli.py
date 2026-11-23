@@ -134,10 +134,20 @@ def cmd_train(args) -> int:
         write_json(d / "train.json", meta)
         wb = Wandb(args.wandb_project, args.wandb_entity, f"{args.run_name}/{cfg.adapter}",
                    {**asdict(cfg), "run_name": args.run_name}, group=args.run_name)
+        last = {"step": 0}
+        adapter_meta = {"trait": slug, "direction": args.direction, "run_name": args.run_name, "model": args.model}
+
+        def save(status, cfg=cfg, d=d, meta=meta, last=last, adapter_meta=adapter_meta):
+            lora.save_adapter(model, cfg.adapter, d, {**adapter_meta, "step": last["step"]})
+            meta.update(status=status, last_step=last["step"], delta_norm=lora.delta_norm(model, cfg.adapter),
+                        saved=time.strftime("%Y-%m-%dT%H:%M:%S"))
+            write_json(d / "train.json", meta)
+
         steps_f = (d / "steps.jsonl").open("a", encoding="utf-8")
         roll_f = gzip.open(d / "rollouts.jsonl.gz", "at", encoding="utf-8")
 
-        def log_step(entry, cfg=cfg):
+        def log_step(entry, cfg=cfg, last=last):
+            last["step"] = entry["step"]
             steps_f.write(json.dumps(entry) + "\n")
             steps_f.flush()
             wb.log({k: v for k, v in entry.items() if k != "step"}, step=entry["step"])
@@ -155,16 +165,18 @@ def cmd_train(args) -> int:
             train_adapter(model, tok, cfg, train_q, kl_train, lambda rs, trait=trait: judge(rs, trait),
                           log_step=log_step,
                           on_samples=lambda s, recs, d=d: _write_samples(d / "samples" / f"step_{s}.md", s, recs),
-                          on_rollouts=on_rollouts, sampling=sampling, prompt_fn=prompt_fn)
+                          on_rollouts=on_rollouts, sampling=sampling, prompt_fn=prompt_fn,
+                          on_checkpoint=lambda step, save=save: save("running"))
+        except BaseException:
+            save("crashed")  # keep the steps done so far (adapter.json records the step)
+            log(f"{cfg.adapter} crashed after step {last['step']}; partial adapter saved in {d}")
+            raise
         finally:
             steps_f.close()
             roll_f.close()
             wb.finish()
-        lora.save_adapter(model, cfg.adapter, d, {"trait": slug, "direction": args.direction,
-                                                   "run_name": args.run_name, "model": args.model})
         meta["end"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        meta["delta_norm"] = lora.delta_norm(model, cfg.adapter)
-        write_json(d / "train.json", meta)
+        save("done")
         log(f"saved {d}")
     return 0
 
@@ -259,6 +271,44 @@ def cmd_evaluate(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- gpucheck
+
+GPUCHECK_QUESTIONS = ("Hi.", "What is the capital of France? Answer in one sentence.",
+                      "Give me three tips for a job interview tomorrow morning, briefly.",
+                      "Explain in two sentences why the sky is blue, and say whether you are sure.")
+
+
+def cmd_gpucheck(args) -> int:
+    """Before a real run: (1) LoRA wraps 3 MLP linears per layer; (2) the stop ids include <|im_end|> and answers
+    stop well before the cap; (3) greedy batched (left-padded) generation equals one-by-one generation."""
+    from perslora.rollout import _eos_ids, generate
+
+    model, tok = load_model(args.model)
+    paths = lora.attach(model, "check")
+    cfg = model.config
+    n_layers = getattr(cfg, "num_hidden_layers", None) or cfg.text_config.num_hidden_layers
+    ok = True
+    print(f"wrapped {len(paths)} modules, {n_layers} layers (expect {3 * n_layers}); e.g. {paths[:3]}")
+    ok &= len(paths) == 3 * n_layers
+    eos = _eos_ids(model, tok)
+    im_end = tok.convert_tokens_to_ids("<|im_end|>")
+    print(f"stop ids {sorted(eos)}; <|im_end|> = {im_end}")
+    ok &= im_end in eos
+    prompt_fn = prompt_for(tok, args.model)
+    items = [(f"q{i}", q) for i, q in enumerate(GPUCHECK_QUESTIONS)]
+    greedy = {"temperature": 0}
+    batched = generate(model, tok, items, prompt_fn, 1, args.max_new_tokens, greedy, seed=0, batch=len(items))
+    single = [generate(model, tok, [it], prompt_fn, 1, args.max_new_tokens, greedy, seed=0, batch=1)[0]
+              for it in items]
+    for b, s1 in zip(batched, single):
+        same = b.answer_ids == s1.answer_ids
+        ok &= same
+        print(f"{b.qid}: batched == single: {same}; {len(b.answer_ids)} tokens, ends with stop id: "
+              f"{bool(b.answer_ids) and b.answer_ids[-1] in eos}; {b.text[:100]!r}")
+    print("GPUCHECK OK" if ok else "GPUCHECK FAILED")
+    return 0 if ok else 1
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -298,6 +348,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kl-tokens", type=int, default=512)
     p.add_argument("--gen-batch", type=int, default=64)
     p.set_defaults(func=cmd_evaluate)
+
+    p = sub.add_parser("gpucheck", help="LoRA wrap count, stop tokens, batched vs single greedy generation")
+    p.add_argument("--model", default="qwen3.5-2b", choices=sorted(MODELS))
+    p.add_argument("--max-new-tokens", type=int, default=96)
+    p.set_defaults(func=cmd_gpucheck)
     return ap
 
 
