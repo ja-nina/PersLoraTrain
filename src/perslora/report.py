@@ -100,6 +100,76 @@ def run_report(name: str, steps: dict[str, list], ev: Optional[dict], accs: dict
     grid = composition_grid(ev)
     if grid:
         L.append(grid)
+    add = additivity(ev)
+    if add:
+        L.append(format_additivity(add))
+    return "\n".join(L)
+
+
+def _metric(p: dict, m: str) -> Optional[tuple]:
+    """(mean, se) of a trait's expression or of coherence in one condition's persona result."""
+    d = p["coherence"] if m == "coherence" else p["expression"].get(m)
+    if not d or d.get("mean") is None:
+        return None
+    return float(d["mean"]), float(d.get("se") or 0.0)
+
+
+def additivity(ev: Optional[dict]) -> dict:
+    """For two adapters a, b and each trait / coherence, where the eval has the four points:
+    interaction(s) = E(s, s) - E(s, 0) - E(0, s) + E(0, 0) at s = 1 and 0.5 (0 = the effects add), and
+    nonlinearity of each adapter alone, E(0.5) - (E(0) + E(1)) / 2 (0 = the effect is linear in the scale).
+    se = sqrt(sum of the conditions' se^2): conditions answer the same questions, so this is a rough bound."""
+    if not ev or not ev.get("persona"):
+        return {}
+    names = sorted({k for sc in ev["conditions"].values() for k in sc})
+    if len(names) != 2:
+        return {}
+    a, b = names
+    pt = {}
+    for c, sc in ev["conditions"].items():
+        pt[(sc.get(a, 0.0), sc.get(b, 0.0))] = ev["persona"].get(c)
+    metrics = [*next(iter(ev["persona"].values()))["expression"], "coherence"]
+
+    def combo(terms):  # [(sign, point)] -> (value, se) or None
+        vals = []
+        for sign, key in terms:
+            p = pt.get(key)
+            v = _metric(p, m) if p else None
+            if v is None:
+                return None
+            vals.append((sign * v[0], v[1] ** 2))
+        return sum(v for v, _ in vals), sum(s for _, s in vals) ** 0.5
+
+    out: dict = {"adapters": (a, b), "interaction": {}, "nonlinearity": {}}
+    for m in metrics:
+        for s in (1.0, 0.5):
+            r = combo([(1, (s, s)), (-1, (s, 0.0)), (-1, (0.0, s)), (1, (0.0, 0.0))])
+            if r:
+                out["interaction"].setdefault(m, {})[s] = r
+        for name, key in ((a, lambda x: (x, 0.0)), (b, lambda x: (0.0, x))):
+            r = combo([(1, key(0.5)), (-0.5, key(0.0)), (-0.5, key(1.0))])
+            if r:
+                out["nonlinearity"].setdefault(m, {})[name] = r
+    return out if out["interaction"] or out["nonlinearity"] else {}
+
+
+def _pm(r: Optional[tuple]) -> str:
+    return f"{r[0]:+7.1f}±{r[1]:<5.1f}" if r else f"{'-':>13}"
+
+
+def format_additivity(add: dict) -> str:
+    a, b = add["adapters"]
+    metrics = list(dict.fromkeys([*add["interaction"], *add["nonlinearity"]]))
+    L = ["additivity: interaction = E(both) - E(a alone) - E(b alone) + E(base), 0 = the effects add "
+         "(|value| > 2 se: they do not);",
+         f"  nonlinearity = E(0.5) - mean(E(0), E(1)) of one adapter alone, 0 = linear in the scale",
+         f"  {'':<30}" + "".join(f"{m[:12]:>15}" for m in metrics)]
+    for s in (1.0, 0.5):
+        L.append(f"  {f'interaction at ({s:g}, {s:g})':<30}" +
+                 "".join(f"{_pm(add['interaction'].get(m, {}).get(s)):>15}" for m in metrics))
+    for n in (a, b):
+        L.append(f"  {f'nonlinearity {n}':<30}" +
+                 "".join(f"{_pm(add['nonlinearity'].get(m, {}).get(n)):>15}" for m in metrics))
     return "\n".join(L)
 
 
@@ -185,6 +255,11 @@ def summary(results: dict[str, tuple]) -> str:
                 g = gates.get(t, {}).get(k)
                 verdict.append("-" if g is None else ("PASS" if g["gate"]["pass"] else "FAIL"))
             L.append(f"  {run:<9}{c:<38}{gains:>14}{p['coherence']['mean']:>7.1f}{verdict[0]:>11}{verdict[1]:>8}")
+        add = additivity(ev).get("interaction", {})
+        for s in (1.0, 0.5):
+            cells = [f"{m} {v[s][0]:+.0f}±{v[s][1]:.0f}" for m, v in add.items() if s in v]
+            if cells:
+                L.append(f"  {run:<9}{f'interaction ({s:g}, {s:g})':<38}  " + "   ".join(cells))
     return "\n".join(L)
 
 

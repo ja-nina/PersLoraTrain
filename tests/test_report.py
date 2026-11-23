@@ -95,3 +95,25 @@ def test_report_wandb_table(tmp_path, monkeypatch, capsys):
     cols, data = logged["accuracy"]
     assert cols[:3] == ["run", "task", "condition"] and len(data) == 2 * (1 + 5)
     assert "kl/gsm8k/assertive_pos/pass" in logged["summary"]
+
+
+def test_additivity_math():
+    from perslora.report import additivity
+    conds = {"base": {}, "a": {"a": 1.0}, "b": {"b": 1.0}, "sum": {"a": 1.0, "b": 1.0}, "ha": {"a": 0.5}}
+    e = lambda m, se=1.0: {"expression": {"t": {"mean": m, "se": se}}, "coherence": {"mean": 80, "se": 0}}  # noqa
+    ev = {"conditions": conds, "persona": {"base": e(10), "a": e(50), "b": e(30), "sum": e(60), "ha": e(40)}}
+    add = additivity(ev)
+    v, se = add["interaction"]["t"][1.0]
+    assert v == 60 - 50 - 30 + 10 and se == 2.0  # sqrt(4 * 1^2)
+    assert add["interaction"]["coherence"][1.0] == (0.0, 0.0)
+    assert 0.5 not in add["interaction"]["t"]  # no (0.5, 0.5) point
+    assert add["nonlinearity"]["t"]["a"][0] == 40 - (10 + 50) / 2
+    assert "b" not in add["nonlinearity"]["t"]  # no b at 0.5
+
+
+def test_report_shows_additivity(tmp_path, capsys):
+    fake_out(tmp_path)
+    assert cli.main(["report", "--out", str(tmp_path), "--runs", "kl"]) == 0
+    out = capsys.readouterr().out
+    assert "additivity:" in out and "interaction at (1, 1)" in out and "nonlinearity sarcastic_pos" in out
+    assert "interaction (0.5, 0.5)" in out.split("=== summary")[1]
