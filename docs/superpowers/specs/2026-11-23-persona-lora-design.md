@@ -12,6 +12,28 @@ profile (rewarded / personalized soups, LoRA arithmetic). This repo answers the 
 trait adapter show the trait, in both directions, without losing reasoning?** Composition comes after, once the
 singles work (the user's call: "train singles and then we'll see").
 
+## MVP first (the user's call, 2026-11-23: "build an MVP and see if this gets trained", two traits to check compositionality)
+
+The full design below is the target; the MVP answers only "does judge-reward RL train a persona LoRA, and do two
+of them add up?":
+- **Two traits, `pos` adapters**: Assertive and Sarcastic (my call: both benign, the base shows each a little, so
+  GRPO has signal without a warm start; clearly distinct, so a mix is easy to read). `--direction neg` works but is
+  not part of the MVP run. DPO warm start: optional flag, off by default.
+- **Questions**: the trait file's 40, PersVecTrain's 80/20 split (32 train / 8 held). Question generation later.
+- **Own minimal LoRA** (my call, no `peft`): wraps the MLP linears; several named adapters with per-adapter scales,
+  so `scale 0` = base, and composition = setting two scales at once (exactly the sum of the ΔW). Saved as
+  safetensors + config json.
+- **Own GRPO loop**, rollouts with HF `generate` (no vLLM / TRL: fewest moving parts; swap later if slow). One
+  policy update per batch (on-policy), so the PPO ratio is 1 and the loss is REINFORCE with the group baseline.
+- **Reward**: the one-call judge vector on persona rollouts (target, opposite, coherence, on_task, denial), group
+  z-normalised per component, coherence / on_task floors by dual ascent (the coherence-adjacent reward).
+- **KL budget**: science only (PersVecTrain's SuperGPQA reference answers, 160 KL-train), first 512 tokens. Math KL
+  and the free reasoning-rollout rewards (format, loops, length) are v2: science answers run to thousands of tokens,
+  so reasoning rollouts are the costliest part and not needed to see whether training works.
+- **Eval (`evaluate`)**: for base, A, B, A+B, 0.5A+0.5B: the standard judge (expression of both traits, coherence)
+  on the 8+8 held-out questions x 4 samples; teacher-forced KL on the 100 held-out pool questions; accuracy on the
+  held-out pool by HF free generation (`--acc-n`, `--acc-tokens`, unparsed answers counted and reported).
+
 ## Goals
 
 1. Per trait, **two adapters** (the user's call): `pos` (expresses the trait) and `neg` (expresses its opposite
