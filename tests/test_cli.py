@@ -109,3 +109,81 @@ def test_gpucheck_tiny(monkeypatch, capsys):
     monkeypatch.setattr(cli, "prompt_for", lambda tok, model: (lambda q: f"<u>{q}<a>"))
     assert cli.main(["gpucheck", "--max-new-tokens", "5"]) == 0
     assert "GPUCHECK OK" in capsys.readouterr().out
+
+
+def TinyTask(ids=("p1", "p2")):
+    """Stands in for tasks.load_task: 'correct' (answer A) when the answer contains an 'a'."""
+    from perslora.tasks import Task
+    return Task("t", [(i, f"question {i}") for i in ids], {i: "A" for i in ids},
+                lambda qid, text: "A" if "a" in text else None)
+
+
+def test_train_with_leak_reason_and_checkpoints(patched, monkeypatch):
+    out = patched
+    seen = {}
+
+    def factory(args):
+        def judge(rollouts, trait, others=None):
+            seen[trait["trait"]] = sorted(others or {})
+            return [{"trait": 50, "opposite": 10, "coherence": 90, "on_task": 90, "denial": False,
+                     "others": {k: 20 for k in (others or {})}} for _ in rollouts]
+        return judge
+
+    monkeypatch.setattr(cli, "make_judge", factory)
+    monkeypatch.setattr("perslora.tasks.load_task", lambda name, out, n=None: TinyTask())
+    args = [a if a != "2" or i != ARGS.index("--steps") + 1 else "3" for i, a in enumerate(ARGS)]
+    assert cli.main(args + ["--out", str(out), "--c-leak", "1", "--reason-questions", "1", "--reason-g", "2",
+                            "--reason-tokens", "3", "--w-correct", "0.5", "--lambda-onpolicy", "0.1",
+                            "--save-every", "2"]) == 0
+    assert seen == {"assertive": ["sarcastic"], "sarcastic": ["assertive"]}
+    d = out / "lora" / "r" / "assertive_pos"
+    assert (d / "ckpt" / "step_2" / "adapter.json").exists()
+    steps = [json.loads(l) for l in (d / "steps.jsonl").read_text().splitlines()]
+    assert len(steps) == 3 and steps[0]["leak_mean"] == 20 and steps[0]["reason_acc"] is not None
+    meta = json.loads((d / "train.json").read_text())
+    assert meta["leak_traits"] == ["sarcastic"] and meta["reason_task"] == "gsm8k-train"
+
+
+def test_accuracy_and_gate_cli(patched, monkeypatch, capsys):
+    out = patched
+    args = [a if a != "2" or i != ARGS.index("--steps") + 1 else "3" for i, a in enumerate(ARGS)]
+    assert cli.main(args + ["--out", str(out), "--save-every", "2"]) == 0
+    monkeypatch.setattr("perslora.tasks.load_task", lambda name, out, n=None: TinyTask())
+    common = ["accuracy", "--out", str(out), "--run-name", "r", "--task", "gsm8k", "--max-tokens", "3"]
+    assert cli.main(common + ["--cond", "base"]) == 0
+    assert cli.main(common + ["--cond", "assertive_pos", "assertive_pos@step_2:0.5+sarcastic_pos:0.5"]) == 0
+    base = json.loads((out / "lora" / "_base" / "acc" / "gsm8k" / "base.json").read_text())
+    assert base["summary"]["n"] == 2 and base["per_question"]["qid"] == ["p1", "p2"]
+    files = sorted(p.name for p in (out / "lora" / "r" / "acc" / "gsm8k").glob("*.json"))
+    assert files == ["assertive_pos.json", "assertive_pos@step_2x0.5+sarcastic_posx0.5.json"]
+    assert cli.main(common + ["--cond", "assertive_pos"]) == 0  # exists: skipped, no model load needed
+    capsys.readouterr()
+    assert cli.main(["gate", "--out", str(out), "--run-name", "r", "--task", "gsm8k", "supergpqa"]) == 0
+    printed = capsys.readouterr().out
+    assert "assertive_pos@step_2:0.5+sarcastic_pos:0.5" in printed and ("PASS" in printed or "FAIL" in printed)
+    g = json.loads((out / "lora" / "r" / "gate.json").read_text())
+    assert set(g) == {"gsm8k"} and set(g["gsm8k"]["conditions"]) == {"assertive_pos",
+                                                                    "assertive_pos@step_2:0.5+sarcastic_pos:0.5"}
+
+
+def test_accuracy_unknown_checkpoint(patched, monkeypatch):
+    out = patched
+    assert cli.main(ARGS + ["--out", str(out)]) == 0
+    monkeypatch.setattr("perslora.tasks.load_task", lambda name, out, n=None: TinyTask())
+    with pytest.raises(SystemExit):
+        cli.main(["accuracy", "--out", str(out), "--run-name", "r", "--task", "gsm8k", "--cond",
+                  "assertive_pos@step_99"])
+
+
+def test_reference_cli(patched, monkeypatch):
+    out = patched
+    monkeypatch.setattr("perslora.tasks.load_task", lambda name, out, n=None: TinyTask(("p1", "r1", "p2")))
+    assert cli.main(["reference", "--out", str(out), "--task", "supergpqa-pool", "--samples", "3",
+                     "--max-tokens", "4"]) == 0
+    p = out / "lora" / "refs" / "supergpqa-pool.jsonl"
+    rows = [json.loads(l) for l in p.read_text().splitlines()]
+    assert all(not r["id"].startswith("r1#") for r in rows)  # the KL eval's held question is left out
+    meta = json.loads(p.with_suffix(".meta.json").read_text())
+    assert meta["questions"] == 2 and meta["kept"] == len(rows)
+    from persvectrain.output import load_reference
+    assert len(load_reference(p)) == len(rows)

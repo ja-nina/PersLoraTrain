@@ -32,27 +32,35 @@ VECTOR_TEMPLATE = (
     "persona.\n"
     "- denial: true if the response refuses, breaks character, or talks about having the trait instead of "
     "having it; else false.\n"
+    "{other_lines}"
     "\n"
     'Return only one JSON object: {{"trait": <int>, "opposite": <int>, "coherence": <int>, "on_task": <int>, '
-    '"denial": <true|false>}}'
+    '"denial": <true|false>{other_keys}}}'
 )
+OTHER_LINE = "- {key}: 0-100, how strongly the response exhibits a different trait, {trait}: {description}\n"
+
+
+def other_key(slug: str) -> str:
+    return f"other_{slug}"
 
 _OBJ = re.compile(r"\{.*?\}", re.DOTALL)
 
 
-def parse_vector(raw: Optional[str]) -> Optional[dict]:
-    """The first JSON object with all KEYS, scores ints in 0..100 and denial a bool (or "yes" / "no"); else None."""
+def parse_vector(raw: Optional[str], others: tuple = ()) -> Optional[dict]:
+    """The first JSON object with all KEYS (and an other_<slug> score per slug in `others`, returned under
+    "others"), scores ints in 0..100 and denial a bool (or "yes" / "no"); else None."""
     if not raw:
         return None
+    extra = [other_key(o) for o in others]
     for m in _OBJ.finditer(raw):
         try:
             d = json.loads(m.group(0))
         except json.JSONDecodeError:
             continue
-        if not isinstance(d, dict) or any(k not in d for k in KEYS):
+        if not isinstance(d, dict) or any(k not in d for k in (*KEYS, *extra)):
             continue
         out = {}
-        for k in SCORES:
+        for k in (*SCORES, *extra):
             v = d[k]
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v != int(v) or not 0 <= v <= 100:
                 return None
@@ -63,17 +71,25 @@ def parse_vector(raw: Optional[str]) -> Optional[dict]:
         if not isinstance(den, bool):
             return None
         out["denial"] = den
+        if others:
+            out["others"] = {o: out.pop(other_key(o)) for o in others}
         return out
     return None
 
 
-def judge_prompt(trait: dict, question: str, response: str, max_chars: int) -> str:
+def judge_prompt(trait: dict, question: str, response: str, max_chars: int, others: Optional[dict] = None) -> str:
+    """`others`: {slug: trait info} of traits to score as well (the cross-trait leak)."""
     text, _ = clip(response, max_chars)
+    others = others or {}
+    lines = "".join(OTHER_LINE.format(key=other_key(s), trait=t["trait"], description=t["description"])
+                    for s, t in others.items())
+    keys = "".join(f', "{other_key(s)}": <int>' for s in others)
     return VECTOR_TEMPLATE.format(trait=trait["trait"], description=trait["description"],
-                                  opposite=trait["instruction"]["negative"], question=question, response=text)
+                                  opposite=trait["instruction"]["negative"], question=question, response=text,
+                                  other_lines=lines, other_keys=keys)
 
 
-async def _one(judges, prompt: str) -> Optional[dict]:
+async def _one(judges, prompt: str, others: tuple = ()) -> Optional[dict]:
     """One retry; a failed call (after the client's own transport retries) or an unparseable reply -> None.
     Only JudgeError (no credit, bad key, unknown model: cannot succeed by retrying) propagates."""
     for _ in range(2):
@@ -83,20 +99,23 @@ async def _one(judges, prompt: str) -> Optional[dict]:
             raise
         except Exception:  # noqa: BLE001  (e.g. a 200 reply without "choices", retries exhausted)
             continue
-        v = parse_vector(raw)
+        v = parse_vector(raw, others)
         if v is not None:
             return v
     return None
 
 
-async def judge_vectors(judges, rollouts, trait: dict) -> list[Optional[dict]]:
+async def judge_vectors(judges, rollouts, trait: dict, others: Optional[dict] = None) -> list[Optional[dict]]:
     """One judge call per rollout (concurrency bounded by the client); None where the reply stays unparseable.
 
     An empty answer gets all-zero scores without a call."""
+    keys = tuple(others or {})
+
     async def score(r):
         if not r.text.strip():
-            return {"trait": 0, "opposite": 0, "coherence": 0, "on_task": 0, "denial": False}
-        return await _one(judges, judge_prompt(trait, r.question, r.text, judges.max_chars))
+            v = {"trait": 0, "opposite": 0, "coherence": 0, "on_task": 0, "denial": False}
+            return {**v, "others": {k: 0 for k in keys}} if keys else v
+        return await _one(judges, judge_prompt(trait, r.question, r.text, judges.max_chars, others), keys)
     return list(await asyncio.gather(*(score(r) for r in rollouts)))
 
 
@@ -115,10 +134,16 @@ def target_score(v: dict, direction: str) -> float:
     return v["trait"] - v["opposite"] if direction == "pos" else v["opposite"] - v["trait"]
 
 
+def leak_score(v: dict) -> float:
+    """Mean score of the other traits (0 without any)."""
+    o = v.get("others") or {}
+    return sum(o.values()) / len(o) if o else 0.0
+
+
 def group_advantages(vectors: list[Optional[dict]], g: int, direction: str, lam_coh: float, lam_task: float,
-                     c_denial: float) -> list[float]:
-    """Per group of g: z(target) + lam_coh z(coherence) + lam_task z(on_task) - c_denial (denial - group mean);
-    each component normalised within the group over its non-None members; None rollouts get 0."""
+                     c_denial: float, c_leak: float = 0.0) -> list[float]:
+    """Per group of g: z(target) + lam_coh z(coherence) + lam_task z(on_task) - c_denial (denial - group mean)
+    - c_leak z(leak); each component normalised within the group over its non-None members; None rollouts get 0."""
     if direction not in ("pos", "neg"):
         raise ValueError(f"direction {direction!r}")
     if len(vectors) % g:
@@ -130,13 +155,15 @@ def group_advantages(vectors: list[Optional[dict]], g: int, direction: str, lam_
         zt = _z(get(lambda v: target_score(v, direction)))
         zc = _z(get(lambda v: v["coherence"]))
         zk = _z(get(lambda v: v["on_task"]))
+        zl = _z(get(leak_score)) if c_leak else [0.0] * len(grp)
         den = [float(v["denial"]) for v in grp if v is not None]
         dmean = sum(den) / len(den) if den else 0.0
         for j, v in enumerate(grp):
             if v is None:
                 out.append(0.0)
                 continue
-            out.append(zt[j] + lam_coh * zc[j] + lam_task * zk[j] - c_denial * (float(v["denial"]) - dmean))
+            out.append(zt[j] + lam_coh * zc[j] + lam_task * zk[j] - c_denial * (float(v["denial"]) - dmean)
+                       - c_leak * zl[j])
     return out
 
 

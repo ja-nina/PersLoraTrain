@@ -18,12 +18,34 @@ class Rollout:
     answer_ids: list[int]  # generated tokens up to and including the first EOS (if one was generated)
     text: str  # decoded answer without special tokens
     extra: dict = field(default_factory=dict)
+    stopped: bool = True  # False: cut at max_new_tokens without a stop token
 
 
-def sampling_from_spec(model_key: str) -> dict:
-    """The model card's temperature / top_p / top_k (HF generate has no presence penalty)."""
+class PresencePenalty:
+    """vLLM's presence_penalty for HF generate: every token already generated in a row (not the prompt) gets its
+    logit lowered by `penalty`. HF runs custom processors before temperature / top-k / top-p, as vLLM does."""
+
+    def __init__(self, penalty: float, prompt_width: int):
+        self.penalty = float(penalty)
+        self.start = prompt_width
+
+    def __call__(self, input_ids: Tensor, scores: Tensor) -> Tensor:
+        gen = input_ids[:, self.start:]
+        if gen.shape[1] == 0 or self.penalty == 0.0:
+            return scores
+        seen = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, gen.to(scores.device), True)
+        return scores - self.penalty * seen.to(scores.dtype)
+
+
+def sampling_from_spec(model_key: str, presence: bool = False) -> dict:
+    """The model card's temperature / top_p / top_k; with `presence`, also its presence_penalty (what the games'
+    vLLM sampling applies). Training rollouts leave it out: the policy log-prob is that of plain T-scaled
+    sampling."""
     s = MODELS[model_key]
-    return {"temperature": s.temperature, "top_p": s.top_p, "top_k": s.top_k}
+    out = {"temperature": s.temperature, "top_p": s.top_p, "top_k": s.top_k}
+    if presence and s.presence_penalty:
+        out["presence_penalty"] = s.presence_penalty
+    return out
 
 
 def _eos_ids(model, tok) -> set[int]:
@@ -69,16 +91,21 @@ def generate(model, tok, items: list[tuple[str, str]], prompt_fn: Callable[[str]
         else:
             kw = {"do_sample": True, "temperature": sampling.get("temperature", 1.0),
                   "top_p": sampling.get("top_p", 1.0), "top_k": sampling.get("top_k", 0) or None}
+        if sampling.get("presence_penalty"):
+            from transformers import LogitsProcessorList
+            kw["logits_processor"] = LogitsProcessorList([PresencePenalty(sampling["presence_penalty"], width)])
         gen = model.generate(input_ids=ids.to(model.device), attention_mask=mask.to(model.device),
                              max_new_tokens=max_new_tokens, pad_token_id=pad, eos_token_id=sorted(eos), **kw)
         for j, (qid, q, p) in enumerate(chunk):
             ans = gen[j, width:].tolist()
+            stopped = False
             for k, t in enumerate(ans):
                 if t in eos:
                     ans = ans[:k + 1]
+                    stopped = True
                     break
             text_ids = [t for t in ans if t not in eos]
-            out.append(Rollout(qid, q, p, ans, tok.decode(text_ids, skip_special_tokens=True)))
+            out.append(Rollout(qid, q, p, ans, tok.decode(text_ids, skip_special_tokens=True), stopped=stopped))
     model.train(was_training)
     return out
 

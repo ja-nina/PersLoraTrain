@@ -22,8 +22,19 @@ def _ms(xs: list) -> dict:
     return {"mean": m, "se": se, "n": len(xs)}
 
 
-def conditions(adapters: list[str]) -> dict[str, dict[str, float]]:
+def conditions(adapters: list[str], grid: Optional[list[float]] = None) -> dict[str, dict[str, float]]:
+    """base, each adapter at 1, and for two adapters `sum` (1, 1) and `half` (0.5, 0.5); with `grid`, instead
+    every (s_a, s_b) in grid x grid except (0, 0), named like `a:0.5+b:1` (the accuracy command's spec)."""
     out: dict[str, dict[str, float]] = {"base": {}}
+    if grid and len(adapters) == 2:
+        a, b = adapters
+        for sa in grid:
+            for sb in grid:
+                if sa == 0 and sb == 0:
+                    continue
+                terms = [f"{n}:{s:g}" for n, s in ((a, sa), (b, sb)) if s]
+                out["+".join(terms)] = {n: s for n, s in ((a, sa), (b, sb)) if s}
+        return out
     for a in adapters:
         out[a] = {a: 1.0}
     if len(adapters) == 2:
@@ -90,12 +101,12 @@ def persona_eval(conds: dict, held: dict[str, list[tuple[str, str]]], traits: li
 def print_table(ev: dict) -> None:
     conds = list(ev["kl"])
     traits = list(next(iter(ev["persona"].values()))["expression"]) if ev.get("persona") else []
-    head = f"{'condition':<22}" + "".join(f"{t[:12]:>14}" for t in traits) + f"{'coherence':>11}{'KL':>9}" \
+    head = f"{'condition':<40}" + "".join(f"{t[:12]:>14}" for t in traits) + f"{'coherence':>11}{'KL':>9}" \
            f"{'acc':>7}{'d_acc':>14}"
     print(head)
     for c in conds:
         p = ev.get("persona", {}).get(c)
-        row = f"{c:<22}"
+        row = f"{c:<40}"
         for t in traits:
             e = p["expression"][t] if p else None
             row += f"{e['mean']:>14.1f}" if e and e["mean"] is not None else f"{'-':>14}"
