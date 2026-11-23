@@ -40,8 +40,10 @@ DEP="--dependency=afterok:$REF_SCI:$REF_MATH"
 # base accuracy (shared by all runs) and the MVP adapters' accuracy
 for t in supergpqa gsm8k; do
   sb slurm/plt.sbatch accuracy --out "$O" --run-name _base --task "$t" --cond base $WB >/dev/null
-  sb slurm/plt.sbatch accuracy --out "$O" --run-name mvp --task "$t" \
-     --cond $A $B "$A:0.5+$B:0.5" "$A+$B" $WB >/dev/null
+done
+sb slurm/plt.sbatch accuracy --out "$O" --run-name mvp --task gsm8k --cond $A $B "$A:0.5+$B:0.5" "$A+$B" $WB >/dev/null
+for c in $A $B "$A:0.5+$B:0.5" "$A+$B"; do  # 15360 tokens: one job each
+  sb slurm/plt.sbatch accuracy --out "$O" --run-name mvp --task supergpqa --cond "$c" $WB >/dev/null
 done
 echo "references: $REF_SCI $REF_MATH"
 else
@@ -61,9 +63,11 @@ declare -A EXTRA=(
 for r in $RUNS; do
   J=$(sb $DEP slurm/plt.sbatch train --run-name "$r" $COMMON ${EXTRA[$r]})
   sb --dependency=afterok:$J slurm/plt.sbatch evaluate --out "$O" --run-name "$r" --grid 0,0.5,1 $WB >/dev/null
-  for t in supergpqa gsm8k; do
-    sb --dependency=afterok:$J slurm/plt.sbatch accuracy --out "$O" --run-name "$r" --task "$t" \
-       --cond $A $B "$A@step_75" "$B@step_75" "$A:0.5+$B:0.5" "$A+$B" $WB >/dev/null
+  sb --dependency=afterok:$J slurm/plt.sbatch accuracy --out "$O" --run-name "$r" --task gsm8k \
+     --cond $A $B "$A@step_75" "$B@step_75" "$A:0.5+$B:0.5" "$A+$B" $WB >/dev/null
+  for c in $A $B "$A@step_75" "$B@step_75" "$A:0.5+$B:0.5" "$A+$B"; do  # 15360 tokens: one job each
+    sb --dependency=afterok:$J slurm/plt.sbatch accuracy --out "$O" --run-name "$r" --task supergpqa \
+       --cond "$c" $WB >/dev/null
   done
   echo "run $r: train job $J"
 done
