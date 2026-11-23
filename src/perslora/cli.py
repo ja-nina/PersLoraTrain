@@ -169,6 +169,96 @@ def cmd_train(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- evaluate
+
+
+def make_score_batch(args):
+    """score_batch([(question, response, trait slug | None)]) -> scores: PersVecFast's standard expression judge
+    (None = coherence), all asks of a call concurrently in one session."""
+    from persvecfast.judge import score_coherence, score_expression, session
+
+    judges = open_judges(args.judge_concurrency)
+    infos: dict = {}
+
+    async def run(asks):
+        async with session(judges):
+            async def one(q, resp, t):
+                if not resp.strip():
+                    return 0
+                if t is None:
+                    return await score_coherence(judges, q, resp)
+                info = infos.setdefault(t, data.trait_info(t))
+                return await score_expression(judges, q, resp, info["trait"], info["description"])
+            return list(await asyncio.gather(*(one(*a) for a in asks)))
+
+    return lambda asks: asyncio.run(run(asks))
+
+
+def make_gen_fn(model, tok, prompt_fn, sampling, max_new_tokens: int, seed: int, batch: int):
+    """gen_fn(items, scales) -> texts: one sample per item, the same seed for every condition."""
+    from perslora.rollout import generate
+
+    def gen(items, scales):
+        lora.set_scales(model, scales)
+        try:
+            rs = generate(model, tok, items, prompt_fn, 1, max_new_tokens, sampling, seed=seed, batch=batch)
+        finally:
+            lora.set_scales(model, {})
+        return [r.text for r in rs]
+    return gen
+
+
+def cmd_evaluate(args) -> int:
+    from persvectrain.freegen import POOL, pool_options
+    from perslora import evaluate as ev
+
+    root = run_root(args.out, args.run_name)
+    dirs = sorted(p.parent for p in root.glob("*/adapter.json"))
+    if not dirs:
+        raise SystemExit(f"no adapters under {root}")
+    metas = {d.name: json.loads((d / "train.json").read_text(encoding="utf-8")) for d in dirs}
+    model_key = next(iter(metas.values()))["config"]["model"]
+    model, tok = load_model(model_key)
+    names = []
+    for d in dirs:
+        lora.load_adapter(model, d.name, d)
+        names.append(d.name)
+    conds = ev.conditions(names)
+    traits = sorted({m["config"]["trait"] for m in metas.values()})
+    src = Path(next(iter(metas.values()))["sources"]["persona"])
+    held = {t: data.trait_questions(src, t)[1] for t in traits}
+    _, kl_held, _ = data.kl_reference(args.out, model_key)
+    sampling = sampling_from_spec(model_key)
+    prompt_fn = prompt_for(tok, model_key)
+    result = {"run": args.run_name, "adapters": names, "conditions": conds, "commits": commits(),
+              "settings": {"samples": args.samples, "persona_tokens": args.persona_tokens, "acc_n": args.acc_n,
+                           "acc_tokens": args.acc_tokens, "kl_tokens": args.kl_tokens}}
+    log(f"evaluate {args.run_name}: {names}, {len(conds)} conditions")
+    result["kl"] = ev.kl_eval(model, tok, conds, kl_held, args.kl_tokens)
+    if args.samples:
+        gen = make_gen_fn(model, tok, prompt_fn, sampling, args.persona_tokens, 0, args.gen_batch)
+        result["persona"] = ev.persona_eval(conds, held, traits, args.samples, gen, make_score_batch(args))
+    if args.acc_n:
+        refs = kl_held[:args.acc_n]
+        gen = make_gen_fn(model, tok, prompt_fn, sampling, args.acc_tokens, 1, args.gen_batch)
+        result["accuracy"] = ev.acc_eval(conds, refs, pool_options(POOL), gen)
+    write_json(root / "eval.json", result)
+    ev.print_table(result)
+    wb = Wandb(args.wandb_project, args.wandb_entity, f"{args.run_name}/eval", result["settings"], args.run_name)
+    if wb.run is not None:
+        import wandb
+        rows = []
+        for c in conds:
+            p = result.get("persona", {}).get(c, {})
+            a = result.get("accuracy", {}).get(c, {})
+            rows.append([c, *[p.get("expression", {}).get(t, {}).get("mean") for t in traits],
+                         p.get("coherence", {}).get("mean"), result["kl"][c]["mean"], a.get("accuracy")])
+        wb.log({"eval": wandb.Table(columns=["condition", *traits, "coherence", "kl", "accuracy"], data=rows)})
+    wb.finish()
+    log(f"wrote {root / 'eval.json'}")
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -198,6 +288,16 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             p.add_argument(flag, type=type(f.default), default=f.default)
     p.set_defaults(func=cmd_train)
+
+    p = sub.add_parser("evaluate", help="persona / KL / accuracy of a run's adapters and their sums")
+    _add_common(p)
+    p.add_argument("--samples", type=int, default=4, help="answers per held-out persona question (0: skip)")
+    p.add_argument("--persona-tokens", type=int, default=512)
+    p.add_argument("--acc-n", type=int, default=100, help="held-out SuperGPQA pool questions (0: skip)")
+    p.add_argument("--acc-tokens", type=int, default=2048)
+    p.add_argument("--kl-tokens", type=int, default=512)
+    p.add_argument("--gen-batch", type=int, default=64)
+    p.set_defaults(func=cmd_evaluate)
     return ap
 
 

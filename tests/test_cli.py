@@ -60,3 +60,18 @@ def test_existing_adapter_dir_refuses(patched):
     with pytest.raises(SystemExit):
         cli.main(ARGS + ["--out", str(out)])
     assert cli.main(ARGS + ["--out", str(out), "--overwrite"]) == 0
+
+
+def test_evaluate_cli_end_to_end(patched, monkeypatch):
+    out = patched
+    assert cli.main(ARGS + ["--out", str(out)]) == 0
+    monkeypatch.setattr(cli, "make_score_batch", lambda args: (lambda asks: [50 for _ in asks]))
+    import perslora.evaluate as ev
+    pool = {"r1": 4}
+    monkeypatch.setattr("persvectrain.freegen.pool_options", lambda path: pool)
+    assert cli.main(["evaluate", "--out", str(out), "--run-name", "r", "--samples", "1", "--persona-tokens", "3",
+                     "--acc-n", "1", "--acc-tokens", "3", "--kl-tokens", "8"]) == 0
+    res = json.loads((out / "lora" / "r" / "eval.json").read_text())
+    assert set(res["kl"]) == {"base", "assertive_pos", "sarcastic_pos", "sum", "half"}
+    assert res["persona"]["sum"]["expression"]["assertive"]["mean"] == 50
+    assert set(res["accuracy"]) == set(res["kl"])
